@@ -8,6 +8,7 @@ dependencies = [
   "deepagents>=0.7,<1",
   "fastapi>=0.115,<1",
   "langchain-openai>=0.3,<2",
+  "pglast>=8,<9",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.8,<3",
   "pypdf>=5,<7",

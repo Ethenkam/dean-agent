@@ -42,7 +42,7 @@ def student_case():
 
 def test_tools_proposal_confirmation_and_stale_check(student_case):
     student_id, old_id, new_id = student_case
-    tools = {item.name: item for item in build_tools(SessionLocal, "agent-user", "run-test")}
+    tools = {item.name: item for item in build_tools(SessionLocal, "agent-user", "run-test", include_legacy=True)}
     with SessionLocal() as db:
         new_code = db.get(Group, new_id).code
         old_code = db.get(Group, old_id).code

@@ -1,21 +1,27 @@
 import io
+import json
 import logging
+import secrets
+import threading
+import time
 import uuid
 import zipfile
+from queue import Empty, Queue
 from xml.etree import ElementTree
 
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
-from dean_agent.agent import ask_agent
+from dean_agent.agent import ChatSessionError, ask_agent
 from dean_agent.config import settings
 from dean_agent.db import SessionLocal, engine
-from dean_agent.models import AuditLog, ChangeProposal, Regulation, RegulationChunk
-from dean_agent.services import ProposalError, resolve_proposal
+from dean_agent.models import AuditLog, Regulation, RegulationChunk, SQLChangeProposal
+from dean_agent.sql_changes import SQLChangeError, decide_sql_change, propose_sql_change
 from dean_agent.vector_search import index_regulation, qdrant_client
 
 
@@ -25,10 +31,23 @@ logger = logging.getLogger(__name__)
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
+    session_id: uuid.UUID | None = None
 
 
-class DecisionRequest(BaseModel):
+class SQLProposalRequest(BaseModel):
+    sql: str = Field(min_length=1, max_length=4000)
+    explanation: str = Field(min_length=15, max_length=2000)
+    reason: str = Field(min_length=10, max_length=2000)
+
+
+class SQLDecisionRequest(BaseModel):
     approve: bool
+    reason: str = Field(min_length=10, max_length=2000)
+
+
+def require_approval_token(token: str) -> None:
+    if not settings.deanery_approval_token or not secrets.compare_digest(token, settings.deanery_approval_token):
+        raise HTTPException(403, "Неверный ключ подтверждения")
 
 
 @app.get("/health")
@@ -62,33 +81,114 @@ def chat(body: ChatRequest, x_actor_id: str = Header(min_length=1, max_length=12
     if settings.openai_model == "your-tool-calling-model":
         raise HTTPException(503, "Настройте OPENAI_MODEL в .env")
     try:
-        return ask_agent(body.message, x_actor_id)
+        return ask_agent(body.message, x_actor_id, body.session_id)
+    except ChatSessionError as exc:
+        raise HTTPException(404, str(exc)) from exc
     except Exception as exc:
+        logger.exception("Agent chat failed (%s)", type(exc).__name__)
         # Do not expose provider credentials or database connection details.
         raise HTTPException(502, f"Агент не ответил: {type(exc).__name__}") from exc
 
 
+@app.post("/chat/stream")
+def chat_stream(body: ChatRequest, x_actor_id: str = Header(min_length=1, max_length=128)) -> StreamingResponse:
+    """Server-sent events: status, session, tool_call, tool_result, done/error."""
+    if settings.openai_model == "your-tool-calling-model":
+        raise HTTPException(503, "Настройте OPENAI_MODEL в .env")
+
+    def events():
+        messages: Queue[tuple[str, dict]] = Queue()
+        started = time.monotonic()
+
+        def emit(event: str, data: dict) -> None:
+            messages.put((event, data))
+
+        def run() -> None:
+            try:
+                result = ask_agent(body.message, x_actor_id, body.session_id, trace_callback=emit)
+                emit("done", result)
+            except ChatSessionError as exc:
+                emit("error", {"type": type(exc).__name__, "message": str(exc)})
+            except Exception as exc:
+                logger.exception("Agent stream failed (%s)", type(exc).__name__)
+                emit("error", {"type": type(exc).__name__, "message": "Агент не ответил"})
+
+        threading.Thread(target=run, daemon=True).start()
+        while True:
+            try:
+                event, data = messages.get(timeout=15)
+            except Empty:
+                event, data = "status", {"phase": "waiting", "elapsed_s": int(time.monotonic() - started),
+                                         "message": "Агент ещё работает"}
+            yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+            if event in {"done", "error"}:
+                break
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.get("/proposals/{proposal_id}")
 def get_proposal(proposal_id: uuid.UUID, x_actor_id: str = Header(min_length=1, max_length=128)) -> dict:
-    with SessionLocal() as db:
-        proposal = db.get(ChangeProposal, proposal_id)
-        if proposal is None:
-            raise HTTPException(404, "Предложение не найдено")
-        return {"id": str(proposal.id), "student_id": proposal.student_id, "field": proposal.field,
-                "old": proposal.old_value, "new": proposal.new_value, "status": proposal.status,
-                "created_by": proposal.actor_id}
+    raise HTTPException(410, "Старый маршрут относится к демонстрационной схеме; используйте /sql-proposals")
 
 
 @app.post("/proposals/{proposal_id}/decision")
-def decide(proposal_id: uuid.UUID, body: DecisionRequest,
-           x_actor_id: str = Header(min_length=1, max_length=128)) -> dict:
+def decide(proposal_id: uuid.UUID, x_actor_id: str = Header(min_length=1, max_length=128)) -> dict:
+    raise HTTPException(410, "Старый маршрут относится к демонстрационной схеме; используйте /sql-proposals")
+
+
+@app.post("/sql-proposals")
+def create_sql_proposal(body: SQLProposalRequest,
+                        x_actor_id: str = Header(min_length=1, max_length=128)) -> dict:
     with SessionLocal() as db:
         try:
-            proposal = resolve_proposal(db, proposal_id, x_actor_id, body.approve)
-        except ProposalError as exc:
+            proposal = propose_sql_change(db, sql_text=body.sql, explanation=body.explanation,
+                                          reason=body.reason, actor_id=x_actor_id,
+                                          agent_run_id="manual-sql")
+        except SQLChangeError as exc:
+            db.rollback()
+            raise HTTPException(422, str(exc)) from exc
+        except SQLAlchemyError as exc:
+            db.rollback()
+            raise HTTPException(422, f"Проверка SQL не прошла ({type(exc.orig).__name__})") from exc
+        return {"id": str(proposal.id), "status": proposal.status,
+                "explanation": proposal.explanation, "reason": proposal.reason,
+                "preview": proposal.preview}
+
+
+@app.get("/sql-proposals/{proposal_id}")
+def get_sql_proposal(proposal_id: uuid.UUID,
+                     x_approval_token: str = Header(min_length=1),
+                     x_actor_id: str = Header(min_length=1, max_length=128)) -> dict:
+    require_approval_token(x_approval_token)
+    with SessionLocal() as db:
+        proposal = db.get(SQLChangeProposal, proposal_id)
+        if proposal is None:
+            raise HTTPException(404, "Предложение не найдено")
+        return {"id": str(proposal.id), "status": proposal.status, "sql": proposal.sql_text,
+                "explanation": proposal.explanation, "reason": proposal.reason,
+                "preview": proposal.preview, "created_by": proposal.actor_id,
+                "decided_by": proposal.decided_by, "decision_reason": proposal.decision_reason}
+
+
+@app.post("/sql-proposals/{proposal_id}/decision")
+def decide_sql_proposal(proposal_id: uuid.UUID, body: SQLDecisionRequest,
+                        x_approval_token: str = Header(min_length=1),
+                        x_actor_id: str = Header(min_length=1, max_length=128)) -> dict:
+    require_approval_token(x_approval_token)
+    with SessionLocal() as db:
+        try:
+            proposal = decide_sql_change(db, proposal_id=proposal_id, approver=x_actor_id,
+                                         decision_reason=body.reason, approve=body.approve)
+        except SQLChangeError as exc:
             db.rollback()
             raise HTTPException(409, str(exc)) from exc
-        return {"id": str(proposal.id), "status": proposal.status}
+        except SQLAlchemyError as exc:
+            db.rollback()
+            raise HTTPException(409, f"Изменение не применено ({type(exc.orig).__name__})") from exc
+        return {"id": str(proposal.id), "status": proposal.status,
+                "preview": proposal.preview}
 
 
 def chunks_from_upload(filename: str, data: bytes) -> list[tuple[int | None, str]]:

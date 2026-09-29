@@ -1,13 +1,19 @@
 import json
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from dean_agent.agent import ask_agent
+import pytest
+
+from dean_agent.agent import ChatSessionError, ask_agent
 from dean_agent.config import settings
+from dean_agent.db import SessionLocal
+from dean_agent.models import ChatSession
 
 
 def test_deepagent_uses_only_business_tools_and_calls_one(monkeypatch):
     requests = []
+    traces = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -19,7 +25,7 @@ def test_deepagent_uses_only_business_tools_and_calls_one(monkeypatch):
             if len(requests) == 1:
                 message = {"role": "assistant", "content": None, "tool_calls": [{
                     "id": "test-call", "type": "function",
-                    "function": {"name": "search_students", "arguments": json.dumps({"group_code": "NO-SUCH-GROUP"})},
+                    "function": {"name": "query_deanery", "arguments": json.dumps({"sql": "SELECT student_id FROM v_students LIMIT 1"})},
                 }]}
                 finish = "tool_calls"
             else:
@@ -41,14 +47,24 @@ def test_deepagent_uses_only_business_tools_and_calls_one(monkeypatch):
     monkeypatch.setattr(settings, "openai_base_url", f"http://127.0.0.1:{server.server_port}/v1")
     monkeypatch.setattr(settings, "openai_model", "mock")
     try:
-        result = ask_agent("Найди студентов", "test-staff")
+        result = ask_agent("Найди студентов", "test-staff",
+                           trace_callback=lambda event, data: traces.append((event, data)))
+        followup = ask_agent("А сколько их?", "test-staff", uuid.UUID(result["session_id"]))
+        with pytest.raises(ChatSessionError):
+            ask_agent("Чужой диалог", "another-staff", uuid.UUID(result["session_id"]))
     finally:
         server.shutdown()
         thread.join(timeout=2)
+        if "result" in locals():
+            with SessionLocal.begin() as db:
+                db.delete(db.get(ChatSession, uuid.UUID(result["session_id"])))
     assert result["answer"] == "Студенты не найдены."
-    assert len(requests) == 2
+    assert len(requests) == 3
+    assert followup["session_id"] == result["session_id"]
+    assert any(item.get("content") == "Найди студентов" for item in requests[2]["messages"])
+    assert any(item.get("content") == "Студенты не найдены." for item in requests[2]["messages"])
     names = {item["function"]["name"] for item in requests[0]["tools"]}
-    assert names == {"search_students", "get_student_profile", "get_grades",
-                     "get_academic_debts", "get_attendance", "get_group_statistics",
-                     "search_regulations", "propose_student_group_change"}
+    assert names == {"query_deanery", "propose_sql_change", "search_regulations"}
     assert any(message.get("role") == "tool" for message in requests[1]["messages"])
+    assert any(event == "tool_call" and data["name"] == "query_deanery" for event, data in traces)
+    assert any(event == "tool_result" for event, _ in traces)

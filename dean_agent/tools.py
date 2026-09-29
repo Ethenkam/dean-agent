@@ -1,13 +1,48 @@
 from sqlalchemy import case, func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from langchain_core.tools import tool
 
 from dean_agent.models import Attendance, Discipline, Grade, Group, Student
+from dean_agent.db import DeaneryReadSession
 from dean_agent.services import ProposalError, propose_group_change
+from dean_agent.sql_query import QueryRejected, execute_read_query
+from dean_agent.sql_changes import SQLChangeError, propose_sql_change as create_sql_proposal
 from dean_agent.vector_search import search_regulations_hybrid
 
 
-def build_tools(session_factory: sessionmaker[Session], actor_id: str, run_id: str):
+def build_tools(session_factory: sessionmaker[Session], actor_id: str, run_id: str,
+                include_legacy: bool = False):
+    @tool
+    def query_deanery(sql: str) -> dict:
+        """Run one read-only PostgreSQL SELECT against the deanery schema. Explicitly list columns and include LIMIT 1..60; OFFSET is allowed. Use deanery views for student, grade, debt, schedule and order facts. Never guess a column: inspect information_schema.columns first."""
+        if DeaneryReadSession is None:
+            return {"error": "Настройте DEANERY_READ_URL для отдельной роли чтения"}
+        with DeaneryReadSession() as db:
+            try:
+                return execute_read_query(db, sql)
+            except QueryRejected as exc:
+                return {"error": str(exc)}
+            except SQLAlchemyError as exc:
+                return {"error": f"Не удалось выполнить SELECT ({type(exc.orig).__name__})"}
+
+    @tool
+    def propose_sql_change(sql: str, explanation: str, reason: str) -> dict:
+        """Propose one INSERT or UPDATE in an allowed deanery work table: document_request, academic_work, grade, attendance, grade_sheet, practice_placement, teaching_assignment, schedule_slot, organization_contact or contact_person. Use only after an explicit request to change data. Give a plain-language explanation and the user's concrete reason. The tool simulates and rolls back the change, then returns a preview and proposal ID; a staff member must confirm separately. Student status, groups, orders, leaves and scholarships require dedicated workflows."""
+        with session_factory() as db:
+            try:
+                proposal = create_sql_proposal(db, sql_text=sql, explanation=explanation,
+                                               reason=reason, actor_id=actor_id, agent_run_id=run_id)
+            except SQLChangeError as exc:
+                db.rollback()
+                return {"error": str(exc)}
+            except SQLAlchemyError as exc:
+                db.rollback()
+                return {"error": f"Не удалось проверить изменение ({type(exc.orig).__name__})"}
+            return {"proposal_id": str(proposal.id), "confirmation_required": True,
+                    "preview": proposal.preview, "explanation": proposal.explanation,
+                    "reason": proposal.reason}
+
     @tool
     def search_students(name: str = "", group_code: str = "") -> list[dict]:
         """Find students by part of full name and/or exact group code. At least one filter is required."""
@@ -91,5 +126,7 @@ def build_tools(session_factory: sessionmaker[Session], actor_id: str, run_id: s
                 return {"error": str(exc)}
             return {"proposal_id": str(proposal.id), "confirmation_required": True, "old": proposal.old_value, "new": proposal.new_value}
 
-    return [search_students, get_student_profile, get_grades, get_academic_debts,
+    if not include_legacy:
+        return [query_deanery, propose_sql_change, search_regulations]
+    return [query_deanery, propose_sql_change, search_students, get_student_profile, get_grades, get_academic_debts,
             get_attendance, get_group_statistics, search_regulations, propose_student_group_change]
