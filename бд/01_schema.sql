@@ -40,13 +40,15 @@ CREATE TABLE academic_title (
 -- Уровни образования (бакалавриат, магистратура …)
 CREATE TABLE education_level (
     level_id      INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    name          VARCHAR(50)  NOT NULL UNIQUE
+    name          VARCHAR(50)  NOT NULL UNIQUE,
+    group_letter CHAR(1) UNIQUE CHECK (group_letter ~ '^[А-ЯЁ]$')
 );
 
 -- Формы обучения (очная, заочная, очно-заочная)
 CREATE TABLE study_form (
     study_form_id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    name          VARCHAR(30)  NOT NULL UNIQUE
+    name          VARCHAR(30)  NOT NULL UNIQUE,
+    group_letter CHAR(1) UNIQUE CHECK (group_letter ~ '^[А-ЯЁ]$')
 );
 
 -- Основа обучения (бюджет, договор)
@@ -217,7 +219,8 @@ CREATE TABLE institute (
     director_id   INT          REFERENCES employee ON DELETE SET NULL,  -- директор института
     office_room   VARCHAR(20),
     phone         VARCHAR(20),
-    email         VARCHAR(120)
+    email         VARCHAR(120),
+    group_letter CHAR(1) UNIQUE CHECK (group_letter ~ '^[А-ЯЁ]$')
 );
 
 CREATE TABLE department (                         -- кафедра

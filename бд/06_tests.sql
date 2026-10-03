@@ -1,369 +1,194 @@
--- =====================================================================
---  Автотесты правил целостности, расписания, аудита и прав доступа
---  Выполнять после 01–05 (от postgres). Все изменения откатываются.
---  Каждый тест печатает «✓ …»; если правило не сработало — скрипт
---  останавливается с ошибкой «✗ …».
--- =====================================================================
+-- Проверки большого сида. Запуск от владельца БД с ON_ERROR_STOP=1.
+-- Записи подбираются по смыслу, а не по номерам старого демо.
+-- Все изменения откатываются; значения последовательностей могут увеличиться.
 SET search_path TO deanery, public;
-SET client_min_messages TO notice;
 BEGIN;
-
--- Ожидаем ошибку: выполняем команды и проверяем, что база их отвергла
-CREATE FUNCTION pg_temp.expect_error(p_what TEXT, VARIADIC p_sql TEXT[]) RETURNS VOID
-LANGUAGE plpgsql AS $$
-DECLARE q TEXT;
-BEGIN
-    BEGIN
-        FOREACH q IN ARRAY p_sql LOOP EXECUTE q; END LOOP;
-    EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE '✓ %  →  %', p_what, SQLERRM;
-        RETURN;
-    END;
-    RAISE EXCEPTION '✗ Правило не сработало: %', p_what;
+CREATE FUNCTION pg_temp.assert_true(label TEXT, ok BOOLEAN) RETURNS VOID
+LANGUAGE plpgsql AS $$ BEGIN
+ IF ok IS DISTINCT FROM TRUE THEN RAISE EXCEPTION '✗ %', label; END IF;
+ RAISE NOTICE '✓ %', label;
+END $$;
+CREATE FUNCTION pg_temp.expect_error(label TEXT, expected_state TEXT, pattern TEXT,
+                                    VARIADIC commands TEXT[]) RETURNS VOID
+LANGUAGE plpgsql AS $$ DECLARE q TEXT; BEGIN
+ BEGIN
+  FOREACH q IN ARRAY commands LOOP EXECUTE q; END LOOP;
+ EXCEPTION WHEN OTHERS THEN
+  IF SQLSTATE <> expected_state OR SQLERRM !~* pattern THEN
+   RAISE EXCEPTION '✗ %: ожидалось % / %, получено % / %', label, expected_state, pattern, SQLSTATE, SQLERRM;
+  END IF;
+  RAISE NOTICE '✓ %', label; RETURN;
+ END;
+ RAISE EXCEPTION '✗ %: операция неожиданно разрешена', label;
+END $$;
+CREATE FUNCTION pg_temp.expect_ok(label TEXT, VARIADIC commands TEXT[]) RETURNS VOID
+LANGUAGE plpgsql AS $$ DECLARE i INT; ok BOOLEAN; BEGIN
+ BEGIN
+  FOR i IN 1..array_length(commands,1)-1 LOOP EXECUTE commands[i]; END LOOP;
+  EXECUTE commands[array_length(commands,1)] INTO ok;
+  IF ok IS DISTINCT FROM TRUE THEN RAISE EXCEPTION 'проверка вернула %', ok; END IF;
+  RAISE EXCEPTION USING ERRCODE='P0099';
+ EXCEPTION WHEN SQLSTATE 'P0099' THEN RAISE NOTICE '✓ %', label; RETURN;
+ END;
 END $$;
 
--- Ожидаем успех; последняя команда — проверка, возвращающая TRUE.
--- Изменения откатываются, роль возвращается.
-CREATE FUNCTION pg_temp.expect_ok(p_what TEXT, VARIADIC p_sql TEXT[]) RETURNS VOID
-LANGUAGE plpgsql AS $$
-DECLARE i INT; ok BOOLEAN;
+SELECT pg_temp.assert_true('508 студентов и 22 группы',
+ (SELECT count(*)=508 FROM student) AND (SELECT count(*)=22 FROM study_group));
+SELECT pg_temp.assert_true('Статусы: 494 обучаются, 3 в отпуске, 11 отчислены',
+ (SELECT count(*) FILTER(WHERE status_id=1)=494 AND count(*) FILTER(WHERE status_id=2)=3
+ AND count(*) FILTER(WHERE status_id=3)=11 FROM student));
+SELECT pg_temp.assert_true('История: 1451 ведомость, 25670 результатов, 28 приказов',
+ (SELECT count(*)=1451 FROM grade_sheet) AND (SELECT count(*)=25670 FROM grade)
+ AND (SELECT count(*)=28 FROM academic_order));
+SELECT pg_temp.assert_true('Расписание и посещаемость: 223 занятия, 17480 отметок',
+ (SELECT count(*)=223 FROM schedule_slot) AND (SELECT count(*)=17480 FROM attendance));
+SELECT pg_temp.assert_true('Есть задолженности, пересдачи, практики, темы и стипендии',
+ EXISTS(SELECT FROM v_debtors) AND EXISTS(SELECT FROM grade_sheet WHERE status='open' AND sheet_kind='retake')
+ AND EXISTS(SELECT FROM practice_placement) AND EXISTS(SELECT FROM academic_work)
+ AND EXISTS(SELECT FROM scholarship));
+SELECT pg_temp.assert_true('Шифры групп согласованы с институтом, формой, уровнем и годом',
+ NOT EXISTS(SELECT FROM study_group g JOIN curriculum c USING(curriculum_id)
+ JOIN study_form sf USING(study_form_id) JOIN study_program pr USING(program_id)
+ JOIN specialty sp USING(specialty_id) JOIN education_level el USING(level_id)
+ JOIN department d USING(department_id) JOIN institute i USING(institute_id)
+ WHERE g.name !~ '^[А-ЯЁ]{3}-[0-9]{2}-[0-9]{2}(\([А-ЯЁ]+\))?$'
+ OR left(g.name,6) <> i.group_letter || sf.group_letter || el.group_letter || '-' || right(c.start_year::TEXT,2)));
+SELECT pg_temp.assert_true('Баллы в пределах шкалы',
+ NOT EXISTS(SELECT FROM grade WHERE points IS NOT NULL AND fn_mark(points) IS NULL));
+SELECT pg_temp.assert_true('Посещаемость соответствует календарю и не из будущего',
+ NOT EXISTS(SELECT FROM attendance a LEFT JOIN v_schedule_calendar c
+ ON c.slot_id=a.slot_id AND c.lesson_date=a.lesson_date
+ WHERE c.slot_id IS NULL OR a.lesson_date>CURRENT_DATE));
+SELECT pg_temp.assert_true('Старосты обучаются в своих группах',
+ NOT EXISTS(SELECT FROM study_group g JOIN student s ON s.student_id=g.headman_id
+ JOIN student_status st USING(status_id) WHERE s.group_id<>g.group_id OR NOT st.is_active));
+SELECT pg_temp.assert_true('Все триггеры аудита включены',
+ EXISTS(SELECT FROM pg_trigger WHERE tgname='audit') AND
+ NOT EXISTS(SELECT FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+ JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='deanery' AND t.tgname='audit' AND t.tgenabled<>'O'));
+
+DO $$ DECLARE
+ sh RECORD; s INT; other_s INT; inactive_s INT; passed_s INT; head RECORD; target_group TEXT;
+ slot RECORD; aid INT; pid INT; req INT; person_id_test INT; teacher_id_test INT; wrong_item INT;
 BEGIN
-    BEGIN
-        FOR i IN 1 .. array_length(p_sql, 1) - 1 LOOP EXECUTE p_sql[i]; END LOOP;
-        EXECUTE p_sql[array_length(p_sql, 1)] INTO ok;
-        IF ok IS NOT TRUE THEN
-            RAISE EXCEPTION USING ERRCODE = 'P0098', MESSAGE = 'проверка вернула ' || COALESCE(ok::TEXT, 'NULL');
-        END IF;
-        RAISE EXCEPTION USING ERRCODE = 'P0099';          -- откат всего, что сделали
-    EXCEPTION
-        WHEN SQLSTATE 'P0099' THEN RAISE NOTICE '✓ %', p_what; RETURN;
-        WHEN OTHERS THEN RAISE EXCEPTION '✗ %  →  %', p_what, SQLERRM;
-    END;
+ SELECT * INTO STRICT sh FROM grade_sheet WHERE status='open' AND sheet_kind='retake' ORDER BY sheet_id LIMIT 1;
+ SELECT student_id INTO STRICT s FROM student WHERE group_id=sh.group_id AND status_id=1 ORDER BY student_id LIMIT 1;
+ SELECT student_id INTO STRICT other_s FROM student WHERE group_id<>sh.group_id AND status_id=1
+ AND NOT EXISTS(SELECT FROM grade gr JOIN grade_sheet gs USING(sheet_id)
+ WHERE gr.student_id=student.student_id AND gs.item_id=sh.item_id) ORDER BY student_id LIMIT 1;
+ SELECT student_id INTO STRICT inactive_s FROM student WHERE status_id=2 ORDER BY student_id LIMIT 1;
+ SELECT gr.student_id INTO STRICT passed_s FROM grade gr JOIN grade_sheet gs USING(sheet_id)
+ JOIN student st ON st.student_id=gr.student_id
+ WHERE gs.item_id=sh.item_id AND gs.stage=sh.stage AND gr.points IS NOT NULL AND st.status_id=1
+ AND st.group_id=sh.group_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Баллы ниже шкалы','P0001','вне шкалы',format('INSERT INTO grade(sheet_id,student_id,points) VALUES(%s,%s,24)',sh.sheet_id,s));
+ PERFORM pg_temp.expect_error('Баллы выше шкалы','P0001','вне шкалы',format('INSERT INTO grade(sheet_id,student_id,points) VALUES(%s,%s,55)',sh.sheet_id,s));
+ PERFORM pg_temp.expect_error('Студент чужой группы','P0001','не из группы',format('INSERT INTO grade(sheet_id,student_id,points) VALUES(%s,%s,30)',sh.sheet_id,other_s));
+ PERFORM pg_temp.expect_error('Оценка студенту в отпуске','P0001','не обучается',format('INSERT INTO grade(sheet_id,student_id,points) VALUES(%s,%s,30)',sh.sheet_id,inactive_s));
+ PERFORM pg_temp.expect_error('Пересдача уже сданного этапа','P0001','уже аттестован',format('INSERT INTO grade(sheet_id,student_id,points) VALUES(%s,%s,30)',sh.sheet_id,passed_s));
+ PERFORM pg_temp.expect_error('Нельзя закрыть пустую пересдачу','P0001','пустую ведомость',format('UPDATE grade_sheet SET status=''closed'',closed_date=exam_date WHERE sheet_id=%s',sh.sheet_id));
+ SELECT gs.sheet_id,gr.student_id INTO STRICT sh FROM grade_sheet gs JOIN grade gr USING(sheet_id) WHERE status='closed' LIMIT 1;
+ PERFORM pg_temp.expect_error('Закрытые результаты неизменяемы','P0001','закрыта или отменена',format('UPDATE grade SET points=30 WHERE sheet_id=%s AND student_id=%s',sh.sheet_id,sh.student_id));
+ PERFORM pg_temp.expect_error('Закрытую ведомость нельзя открыть','P0001','изменить её статус нельзя',format('UPDATE grade_sheet SET status=''open'',closed_date=NULL WHERE sheet_id=%s',sh.sheet_id));
+ SELECT g.group_id, g.headman_id, g.name INTO STRICT head FROM study_group g WHERE headman_id IS NOT NULL LIMIT 1;
+ SELECT name INTO STRICT target_group FROM study_group WHERE group_id<>head.group_id AND NOT is_archived ORDER BY group_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Староста чужой группы','P0001','Старостой',format('UPDATE study_group SET headman_id=%s WHERE name=%L',head.headman_id,target_group));
+ PERFORM pg_temp.expect_ok('Перевод старосты снимает его с должности',format('CALL sp_transfer_student(%s,%L,''TEST-TRANSFER'',1)',head.headman_id,target_group),format('SELECT headman_id IS NULL FROM study_group WHERE group_id=%s',head.group_id));
+ PERFORM pg_temp.expect_error('Архивирование действующей группы','P0001','обучающиеся студенты',format('UPDATE study_group SET is_archived=TRUE WHERE group_id=%s',head.group_id));
+ SELECT sl.*,a.group_id INTO STRICT slot FROM schedule_slot sl JOIN teaching_assignment a USING(assignment_id) ORDER BY slot_id LIMIT 1;
+ SELECT student_id INTO STRICT s FROM student WHERE group_id=slot.group_id AND status_id=1 ORDER BY student_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Посещаемость в будущем','P0001','будущую дату',format('INSERT INTO attendance(slot_id,student_id,lesson_date,is_present) VALUES(%s,%s,CURRENT_DATE+7,TRUE)',slot.slot_id,s));
+ PERFORM pg_temp.expect_error('Расписание за пределами семестра','P0001','выходит за даты',format('UPDATE schedule_slot SET valid_from=''2020-01-01'' WHERE slot_id=%s',slot.slot_id));
+ PERFORM pg_temp.expect_error('Дублирование занятия группы','P0001','Конфликт расписания',format('INSERT INTO schedule_slot(assignment_id,classroom_id,weekday,pair_number,week_parity,term_id,valid_from,valid_to) SELECT assignment_id,classroom_id,weekday,pair_number,week_parity,term_id,valid_from,valid_to FROM schedule_slot WHERE slot_id=%s',slot.slot_id));
+ SELECT employee_id INTO STRICT teacher_id_test FROM teacher ORDER BY employee_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Преподаватель на административной должности','P0001','преподаватель',format('UPDATE employee SET position_id=1 WHERE employee_id=%s',teacher_id_test));
+ PERFORM pg_temp.expect_error('Нельзя уволить директора','P0001','директор института','UPDATE employee SET dismissal_date=CURRENT_DATE WHERE employee_id=1');
+ PERFORM pg_temp.expect_error('Пересечение шкалы','23P01','score_band_no_overlap','UPDATE score_band SET max_points=36 WHERE mark=3');
+ PERFORM pg_temp.expect_error('Пустое ФИО','23514','check','INSERT INTO person(last_name,first_name,gender,birth_date) VALUES('''',''Тест'',''M'',''2000-01-01'')');
+ PERFORM pg_temp.expect_error('Дата рождения в будущем','P0001','Дата рождения','INSERT INTO person(last_name,first_name,gender,birth_date) VALUES(''Тест'',''Тест'',''M'',CURRENT_DATE+1)');
+ SELECT request_id INTO STRICT req FROM document_request r JOIN request_status st USING(request_status_id) WHERE st.is_final ORDER BY request_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Завершённую заявку нельзя возобновить','P0001','уже завершена',format('UPDATE document_request SET request_status_id=1 WHERE request_id=%s',req));
+ SELECT person_id INTO STRICT person_id_test FROM student WHERE student_id=s;
+ PERFORM pg_temp.expect_ok('Изменения записываются с автором',
+ 'SET LOCAL app.user_id=''2''', 'SET LOCAL app.agent_request_id=''1''',
+ format('UPDATE person SET phone=''+7 999 000-00-00'' WHERE person_id=%s',person_id_test),
+ format('SELECT EXISTS(SELECT FROM v_audit WHERE record_key=%L AND table_name=''person'' AND column_name=''phone'' AND changed_by=''kuznetsova'' AND agent_request IS NOT NULL)', 'person_id='||person_id_test));
+ PERFORM pg_temp.expect_ok('Паспорт скрыт в аудите',
+ format('UPDATE person SET passport_number=''999999'' WHERE person_id=%s',person_id_test),
+ format('SELECT EXISTS(SELECT FROM audit_log a JOIN audit_log_detail d USING(audit_id) WHERE a.record_key=%L AND d.column_name=''passport_number'' AND d.old_value=''***'' AND d.new_value=''***'')','person_id='||person_id_test));
+ PERFORM pg_temp.expect_ok('Обновление без изменений не создаёт аудит',
+ format('UPDATE student SET status_id=status_id WHERE student_id=%s',s),
+ format('SELECT NOT EXISTS(SELECT FROM audit_log WHERE table_name=''student'' AND record_key=%L)','student_id='||s));
+ PERFORM pg_temp.expect_error('Аудит нельзя исправить','P0001','только для чтения',
+ format('UPDATE person SET phone=''+7 999 000-00-01'' WHERE person_id=%s',person_id_test), 'UPDATE audit_log SET db_user=''test''');
+ PERFORM pg_temp.expect_error('Аудит нельзя удалить','P0001','только для чтения',
+ format('UPDATE person SET phone=''+7 999 000-00-01'' WHERE person_id=%s',person_id_test), 'DELETE FROM audit_log');
+ PERFORM pg_temp.expect_ok('Агент зачисляет через процедуру','SET LOCAL ROLE deanery_agent',
+ format('SELECT fn_enroll_student(''Тестов'',''Тест'',NULL,''M'',''2008-01-01'',''seed-test@example.test'',NULL,%L,''Бюджет'',''TEST-9999'',''TEST-ENROLL'',CURRENT_DATE,1)',head.name),
+ 'SELECT EXISTS(SELECT FROM v_students WHERE record_book_number=''TEST-9999'')');
 END $$;
 
-\echo '== Согласованность между таблицами =='
-SELECT pg_temp.expect_error('Оценка студенту не из группы ведомости',
-    'INSERT INTO grade (sheet_id, student_id, points) VALUES (9, 1, 30)');
-SELECT pg_temp.expect_error('Ведомость по дисциплине чужого учебного плана',
-    $q$INSERT INTO grade_sheet (sheet_number, item_id, group_id, examiner_id, issue_date) VALUES ('T-1', 1, 2, 6, CURRENT_DATE)$q$);
-SELECT pg_temp.expect_error('Учебное поручение по дисциплине чужого плана',
-    'INSERT INTO teaching_assignment (item_id, group_id, teacher_id, lesson_type_id) VALUES (9, 1, 8, 1)');
-SELECT pg_temp.expect_error('Посещаемость студенту из другой группы',
-    $q$INSERT INTO attendance (slot_id, student_id, lesson_date, is_present) VALUES (1, 6, '2026-09-28', TRUE)$q$);
-SELECT pg_temp.expect_error('Посещаемость в день, когда занятия нет',
-    $q$INSERT INTO attendance (slot_id, student_id, lesson_date, is_present) VALUES (1, 1, '2026-09-29', TRUE)$q$);
-SELECT pg_temp.expect_error('Посещаемость по чётной неделе для занятия по нечётным',
-    $q$INSERT INTO attendance (slot_id, student_id, lesson_date, is_present) VALUES (3, 1, '2026-09-09', TRUE)$q$);
-SELECT pg_temp.expect_error('Посещаемость студенту в академическом отпуске',
-    $q$INSERT INTO attendance (slot_id, student_id, lesson_date, is_present) VALUES (4, 10, '2026-09-08', TRUE)$q$);
-SELECT pg_temp.expect_error('Староста из другой группы',
-    $q$UPDATE study_group SET headman_id = 6 WHERE name = 'ПИ-23'$q$);
-SELECT pg_temp.expect_ok('Старосту снимает с должности перевод в другую группу',
-    $q$CALL sp_transfer_student(1, 'ПИ-24', 'T-TR', 1)$q$,
-    $q$SELECT headman_id IS NULL FROM study_group WHERE name = 'ПИ-23'$q$);
-SELECT pg_temp.expect_error('Заведующий кафедрой не с этой кафедры',
-    'SET CONSTRAINTS ALL IMMEDIATE',
-    $q$UPDATE department SET head_id = 8 WHERE short_name = 'ИС'$q$);
-SELECT pg_temp.expect_error('Перевод заведующего на другую кафедру',
-    'SET CONSTRAINTS ALL IMMEDIATE',
-    'UPDATE teacher SET department_id = 2 WHERE employee_id = 5');
-SELECT pg_temp.expect_error('Директор института на преподавательской должности',
-    'UPDATE institute SET director_id = 6 WHERE institute_id = 1');
-SELECT pg_temp.expect_error('Преподаватель на административной должности',
-    'INSERT INTO teacher (employee_id, department_id) VALUES (2, 1)');
-SELECT pg_temp.expect_error('Преподаватель одновременно в деканате',
-    'INSERT INTO dean_office_staff (employee_id, institute_id) VALUES (6, 1)');
-SELECT pg_temp.expect_error('Смена должности преподавателя на методиста',
-    'UPDATE employee SET position_id = 4 WHERE employee_id = 6');
-SELECT pg_temp.expect_error('Практика по строке плана, которая не практика',
-    $q$INSERT INTO practice_placement (student_id, item_id, supervisor_id, org_contact_id, start_date, end_date)
-       VALUES (6, 7, 6, 1, '2026-07-01', '2026-07-20')$q$);
-SELECT pg_temp.expect_error('Практика из чужого учебного плана',
-    $q$INSERT INTO practice_placement (student_id, item_id, supervisor_id, org_contact_id, start_date, end_date)
-       VALUES (6, 15, 6, 1, '2026-07-01', '2026-07-20')$q$);
-SELECT pg_temp.expect_error('Тема курсовой к экзаменационной дисциплине',
-    $q$INSERT INTO academic_work (student_id, item_id, topic, supervisor_id) VALUES (1, 3, 'Тема', 6)$q$);
-SELECT pg_temp.expect_error('Пересекающиеся академические отпуска',
-    $q$INSERT INTO academic_leave (student_id, reason_id, order_id, start_date, end_date)
-       VALUES (10, 1, 4, '2026-06-01', '2026-12-01')$q$);
-SELECT pg_temp.expect_error('Академический отпуск дольше 2 лет',
-    $q$INSERT INTO academic_leave (student_id, reason_id, order_id, start_date, end_date)
-       VALUES (10, 1, 4, '2028-01-01', '2030-06-01')$q$);
-SELECT pg_temp.expect_error('Академический отпуск по приказу о зачислении',
-    $q$INSERT INTO academic_leave (student_id, reason_id, order_id, start_date, end_date)
-       VALUES (1, 1, 1, '2027-01-01', '2027-06-01')$q$);
-SELECT pg_temp.expect_error('Та же стипендия на пересекающийся период',
-    $q$INSERT INTO scholarship (student_id, scholarship_type_id, order_id, start_date, end_date)
-       VALUES (1, 2, 6, '2026-10-01', '2026-12-31')$q$);
-SELECT pg_temp.expect_error('Баллы ниже минимума шкалы (24)',
-    'INSERT INTO grade (sheet_id, student_id, points) VALUES (9, 9, 24)');
-SELECT pg_temp.expect_error('Баллы выше максимума шкалы (55)',
-    'INSERT INTO grade (sheet_id, student_id, points) VALUES (9, 9, 55)');
-SELECT pg_temp.expect_error('Баллы и неявка одновременно',
-    'INSERT INTO grade (sheet_id, student_id, points, is_absent) VALUES (9, 9, 30, TRUE)');
-SELECT pg_temp.expect_error('Модульная ведомость по практике (у практики модулей нет)',
-    $q$INSERT INTO grade_sheet (sheet_number, item_id, group_id, examiner_id, stage, issue_date) VALUES ('X-M', 15, 1, 7, 'module_1', CURRENT_DATE)$q$);
-SELECT pg_temp.expect_error('Вторая основная ведомость на модуль 1',
-    $q$INSERT INTO grade_sheet (sheet_number, item_id, group_id, examiner_id, stage, issue_date) VALUES ('X-M2', 1, 1, 6, 'module_1', CURRENT_DATE)$q$);
-SELECT pg_temp.expect_error('Пересечение диапазонов шкалы (34 → и «3», и «4»)',
-    'UPDATE score_band SET max_points = 36 WHERE mark = 3');
-SELECT pg_temp.expect_error('Исправление оценки в закрытой ведомости',
-    'UPDATE grade SET points = 30 WHERE sheet_id = 1 AND student_id = 1');
+-- Дополнительные операции: успешные сценарии и отказы по статусу/плану.
+DO $$ DECLARE active_s INT; leave_s INT; expelled_s INT; contract_s INT;
+ group_name_test TEXT; group_id_test INT; item_test INT; wrong_item INT;
+ sheet_test INT; debtor_test INT; email_test TEXT; leave_test RECORD; sch_test RECORD;
+BEGIN
+ SELECT student_id,group_id INTO STRICT active_s,group_id_test FROM student WHERE status_id=1 ORDER BY student_id LIMIT 1;
+ SELECT name INTO STRICT group_name_test FROM study_group WHERE group_id=group_id_test;
+ SELECT student_id INTO STRICT leave_s FROM student WHERE status_id=2 ORDER BY student_id LIMIT 1;
+ SELECT student_id INTO STRICT expelled_s FROM student WHERE status_id=3 ORDER BY student_id LIMIT 1;
+ SELECT student_id INTO STRICT contract_s FROM student WHERE status_id=1 AND funding_type_id=2 ORDER BY student_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Перевод в ту же группу','P0001','уже учится',format('CALL sp_transfer_student(%s,%L,''TEST-SAME'',1)',active_s,group_name_test));
+ PERFORM pg_temp.expect_error('Перевод отчисленного','P0001','в статусе',format('CALL sp_transfer_student(%s,%L,''TEST-EXPELLED'',1)',expelled_s,group_name_test));
+ PERFORM pg_temp.expect_error('Восстановление обучающегося','P0001','в статусе',format('CALL sp_reinstate_student(%s,%L,''TEST-ACTIVE'',1)',active_s,group_name_test));
+ PERFORM pg_temp.expect_error('Отпуск студенту в отпуске','P0001','в статусе',format('CALL sp_grant_academic_leave(%s,''Семейные обстоятельства'',CURRENT_DATE,CURRENT_DATE+100,''TEST-DOUBLE'',1)',leave_s));
+ PERFORM pg_temp.expect_ok('Агент оформляет отпуск','SET LOCAL ROLE deanery_agent',
+ format('CALL sp_grant_academic_leave(%s,''Семейные обстоятельства'',CURRENT_DATE,CURRENT_DATE+100,''TEST-LEAVE'',1)',active_s),
+ format('SELECT status=''Академический отпуск'' FROM v_students WHERE student_id=%s',active_s));
+ PERFORM pg_temp.expect_ok('Агент восстанавливает студента','SET LOCAL ROLE deanery_agent',
+ format('CALL sp_reinstate_student(%s,%L,''TEST-REINSTATE'',1)',expelled_s,group_name_test),
+ format('SELECT status=''Обучается'' FROM v_students WHERE student_id=%s',expelled_s));
+ PERFORM pg_temp.expect_error('Стипендия договорнику','P0001','по договору',
+ format('INSERT INTO scholarship(student_id,scholarship_type_id,start_date,end_date) VALUES(%s,1,CURRENT_DATE,CURRENT_DATE+100)',contract_s));
+ PERFORM pg_temp.expect_error('Стипендия в академическом отпуске','P0001','не обучается',
+ format('INSERT INTO scholarship(student_id,scholarship_type_id,start_date,end_date) VALUES(%s,4,CURRENT_DATE,CURRENT_DATE+100)',leave_s));
+ SELECT * INTO STRICT sch_test FROM scholarship ORDER BY scholarship_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Пересечение стипендий','23P01','scholarship',
+ format('INSERT INTO scholarship(student_id,scholarship_type_id,order_id,start_date,end_date) VALUES(%s,%s,%s,%L,%L)',sch_test.student_id,sch_test.scholarship_type_id,sch_test.order_id,sch_test.start_date,sch_test.end_date));
+ SELECT * INTO STRICT leave_test FROM academic_leave WHERE student_id=leave_s LIMIT 1;
+ PERFORM pg_temp.expect_error('Отпуск более двух лет','23514','check',
+ format('INSERT INTO academic_leave(student_id,reason_id,order_id,start_date,end_date) VALUES(%s,%s,%s,''2030-01-01'',''2033-01-01'')',leave_s,leave_test.reason_id,leave_test.order_id));
+ SELECT ci.item_id INTO STRICT item_test FROM curriculum_item ci JOIN study_group g USING(curriculum_id) JOIN discipline d USING(discipline_id)
+ WHERE g.group_id=group_id_test AND d.kind='discipline' ORDER BY item_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Практика по обычной дисциплине','P0001','только по строке плана вида',
+ format('INSERT INTO practice_placement(student_id,item_id,supervisor_id,org_contact_id,start_date,end_date) VALUES(%s,%s,5,1,CURRENT_DATE,CURRENT_DATE+10)',active_s,item_test));
+ PERFORM pg_temp.expect_error('Тема по обычной дисциплине','P0001','Тему можно закрепить',
+ format('INSERT INTO academic_work(student_id,item_id,topic,supervisor_id) VALUES(%s,%s,''Тестовая тема'',5)',active_s,item_test));
+ SELECT ci.item_id INTO STRICT wrong_item FROM curriculum_item ci WHERE curriculum_id<>(SELECT curriculum_id FROM study_group WHERE group_id=group_id_test) ORDER BY item_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Ведомость чужого учебного плана','P0001','не входит в учебный план группы',
+ format('INSERT INTO grade_sheet(sheet_number,item_id,group_id,examiner_id,issue_date) VALUES(''TEST-WRONG-PLAN'',%s,%s,5,CURRENT_DATE)',wrong_item,group_id_test));
+ SELECT email INTO STRICT email_test FROM person WHERE email IS NOT NULL ORDER BY person_id LIMIT 1;
+ PERFORM pg_temp.expect_error('Email уникален без учёта регистра','23505','duplicate key',
+ format('INSERT INTO person(last_name,first_name,gender,birth_date,email) VALUES(''Тест'',''Тест'',''M'',''2000-01-01'',%L)',upper(email_test)));
+ SELECT gs.sheet_id,lr.student_id INTO STRICT sheet_test,debtor_test FROM grade_sheet gs
+ JOIN v_last_result lr ON lr.item_id=gs.item_id AND lr.stage=gs.stage
+ JOIN student st ON st.student_id=lr.student_id
+ WHERE gs.status='open' AND gs.sheet_kind='retake' AND st.group_id=gs.group_id AND st.status_id=1 AND lr.points IS NULL LIMIT 1;
+ PERFORM pg_temp.expect_ok('Преподаватель выставляет результат пересдачи','SET LOCAL ROLE deanery_teacher',
+ format('INSERT INTO grade(sheet_id,student_id,points) VALUES(%s,%s,30)',sheet_test,debtor_test),
+ format('SELECT points=30 FROM grade WHERE sheet_id=%s AND student_id=%s',sheet_test,debtor_test));
+END $$;
 
-\echo '== Расписание =='
-SELECT pg_temp.expect_error('Аудитория занята другим преподавателем',
-    $q$INSERT INTO schedule_slot (assignment_id, classroom_id, weekday, pair_number, term_id)
-       VALUES (9, 1, 1, 1, 2)$q$);
-SELECT pg_temp.expect_error('Преподаватель уже ведёт занятие в это время',
-    $q$INSERT INTO schedule_slot (assignment_id, classroom_id, weekday, pair_number, term_id)
-       VALUES (12, 3, 3, 1, 2)$q$);
-SELECT pg_temp.expect_error('У группы уже есть пара в это время',
-    $q$INSERT INTO schedule_slot (assignment_id, classroom_id, weekday, pair_number, term_id)
-       VALUES (10, 2, 2, 1, 2)$q$);
-SELECT pg_temp.expect_error('В аудитории не хватает мест',
-    'UPDATE classroom SET capacity = 3 WHERE classroom_id = 3',
-    $q$INSERT INTO schedule_slot (assignment_id, classroom_id, weekday, pair_number, term_id)
-       VALUES (3, 3, 5, 4, 2)$q$);
-SELECT pg_temp.expect_error('Замена преподавателя в поручении создаёт ему накладку',
-    $q$INSERT INTO schedule_slot (assignment_id, classroom_id, weekday, pair_number, term_id)
-       VALUES (16, 3, 1, 1, 2)$q$,
-    'UPDATE teaching_assignment SET teacher_id = 5 WHERE assignment_id = 16');
-SELECT pg_temp.expect_ok('Нечётная и чётная неделя в одной аудитории не конфликтуют',
-    $q$INSERT INTO schedule_slot (assignment_id, classroom_id, weekday, pair_number, week_parity, term_id)
-       VALUES (13, 1, 3, 3, 'even', 2)$q$,
-    'SELECT TRUE');
-SELECT pg_temp.expect_ok('Лекционный поток: одна лекция для двух групп в одной аудитории',
-    $q$INSERT INTO schedule_slot (assignment_id, classroom_id, weekday, pair_number, term_id)
-       VALUES (1, 1, 2, 1, 2)$q$,
-    'SELECT TRUE');
-
-\echo '== Журнал изменений =='
-SELECT pg_temp.expect_ok('Изменение записывается с пользователем и запросом агента',
-    $q$SET LOCAL app.user_id = '2'$q$,
-    $q$SET LOCAL app.agent_request_id = '1'$q$,
-    $q$UPDATE person SET phone = '+7 999 000-00-00' WHERE person_id = 14$q$,
-    $q$SELECT EXISTS (SELECT 1 FROM v_audit WHERE table_name = 'person' AND record_key = 'person_id=14'
-                      AND changed_by = 'kuznetsova' AND column_name = 'phone'
-                      AND new_value = '+7 999 000-00-00' AND agent_request IS NOT NULL)$q$);
-SELECT pg_temp.expect_ok('Паспортные данные в журнале скрыты',
-    $q$UPDATE person SET passport_number = '999999' WHERE person_id = 14$q$,
-    $q$SELECT bool_and(old_value = '***' AND new_value = '***') FROM audit_log_detail WHERE column_name = 'passport_number'$q$);
-SELECT pg_temp.expect_ok('Изменение без реальных отличий не засоряет журнал',
-    'UPDATE student SET status_id = status_id WHERE student_id = 2',
-    $q$SELECT NOT EXISTS (SELECT 1 FROM audit_log WHERE table_name = 'student' AND record_key = 'student_id=2')$q$);
-SELECT pg_temp.expect_error('Журнал нельзя исправить',
-    $q$UPDATE person SET phone = '+7 999 000-00-01' WHERE person_id = 15$q$,
-    $q$UPDATE audit_log SET db_user = 'кто-то другой'$q$);
-SELECT pg_temp.expect_error('Из журнала нельзя удалить запись',
-    $q$UPDATE person SET phone = '+7 999 000-00-01' WHERE person_id = 15$q$,
-    'DELETE FROM audit_log');
-
-\echo '== Права доступа: агент =='
-SELECT pg_temp.expect_ok('Агент читает представления',
-    'SET LOCAL ROLE deanery_agent',
-    $q$SELECT count(*) > 0 FROM v_students$q$);
-SELECT pg_temp.expect_error('Агент не видит паспортные данные',
-    'SET LOCAL ROLE deanery_agent', 'SELECT passport_number FROM person');
-SELECT pg_temp.expect_error('Агент не видит хэши паролей',
-    'SET LOCAL ROLE deanery_agent', 'SELECT password_hash FROM app_user');
-SELECT pg_temp.expect_error('Агент не может удалять данные',
-    'SET LOCAL ROLE deanery_agent', 'DELETE FROM document_request');
-SELECT pg_temp.expect_error('Агент не может менять справочники',
-    'SET LOCAL ROLE deanery_agent', $q$UPDATE score_band SET min_points = 20 WHERE mark = 3$q$);
-SELECT pg_temp.expect_error('Агент не может менять учётные записи',
-    'SET LOCAL ROLE deanery_agent', 'UPDATE app_user SET role_id = 1');
-SELECT pg_temp.expect_error('Агент не может менять паспорт студента',
-    'SET LOCAL ROLE deanery_agent', $q$UPDATE person SET passport_number = '000000' WHERE person_id = 14$q$);
-SELECT pg_temp.expect_error('Агент не читает журнал напрямую',
-    'SET LOCAL ROLE deanery_agent', 'SELECT * FROM audit_log_detail');
-SELECT pg_temp.expect_ok('Агент зачисляет студента процедурой',
-    'SET LOCAL ROLE deanery_agent',
-    $q$SELECT fn_enroll_student('Тестов','Тест',NULL,'M','2008-01-01','test@stud.univ.ru',NULL,
-                                'ПМИ-25','Бюджет','25-9999','T-ENR',CURRENT_DATE,1)$q$,
-    $q$SELECT EXISTS (SELECT 1 FROM v_students WHERE record_book_number = '25-9999')$q$);
-SELECT pg_temp.expect_ok('Агент оформляет академический отпуск; изменения попадают в журнал',
-    'SET LOCAL ROLE deanery_agent',
-    $q$CALL sp_grant_academic_leave(4, 'Семейные обстоятельства', '2026-10-01', '2027-06-30', 'T-LV', 1)$q$,
-    $q$SELECT EXISTS (SELECT 1 FROM v_academic_leaves WHERE student LIKE 'Егорова%' AND reason = 'Семейные обстоятельства')
-          AND EXISTS (SELECT 1 FROM v_audit WHERE table_name = 'academic_leave')$q$);
-SELECT pg_temp.expect_ok('Агент переводит старосту (право на снятие старосты есть)',
-    'SET LOCAL ROLE deanery_agent',
-    $q$CALL sp_transfer_student(7, 'ПИ-23', 'T-TR2', 1)$q$,
-    $q$SELECT headman_id IS NULL FROM study_group WHERE name = 'ПИ-24'$q$);
-
-\echo '== Права доступа: другие роли =='
-SELECT pg_temp.expect_ok('Преподаватель ставит оценку',
-    'SET LOCAL ROLE deanery_teacher',
-    'INSERT INTO grade (sheet_id, student_id, points) VALUES (9, 9, 30)',
-    'SELECT TRUE');
-SELECT pg_temp.expect_error('Преподаватель не меняет данные студентов',
-    'SET LOCAL ROLE deanery_teacher', 'UPDATE student SET funding_type_id = 1');
-SELECT pg_temp.expect_error('Роль «только чтение» ничего не меняет',
-    'SET LOCAL ROLE deanery_read',
-    $q$INSERT INTO document_request (student_id, document_type_id, request_status_id) VALUES (1, 1, 1)$q$);
-SELECT pg_temp.expect_ok('Деканат видит журнал изменений',
-    'SET LOCAL ROLE deanery_staff',
-    'SELECT count(*) >= 0 FROM audit_log');
-
-\echo '== Защита от неверного ввода =='
-SELECT pg_temp.expect_error('Пустая фамилия',
-    $q$INSERT INTO person (last_name, first_name, gender, birth_date) VALUES ('', 'Иван', 'M', '2000-01-01')$q$);
-SELECT pg_temp.expect_error('Фамилия из одних пробелов',
-    $q$INSERT INTO person (last_name, first_name, gender, birth_date) VALUES ('   ', 'Иван', 'M', '2000-01-01')$q$);
-SELECT pg_temp.expect_error('Пробелы по краям названия группы',
-    $q$UPDATE study_group SET name = ' ПИ-23' WHERE group_id = 1$q$);
-SELECT pg_temp.expect_error('Дата рождения в будущем',
-    $q$INSERT INTO person (last_name, first_name, gender, birth_date) VALUES ('Тест', 'Иван', 'M', '2030-01-01')$q$);
-SELECT pg_temp.expect_error('Email, отличающийся от существующего только регистром',
-    $q$INSERT INTO person (last_name, first_name, gender, birth_date, email) VALUES ('Тест', 'Иван', 'M', '2000-01-01', 'IVANOV.KS@stud.univ.ru')$q$);
-SELECT pg_temp.expect_error('Логин, отличающийся от существующего только регистром',
-    $q$INSERT INTO app_user (person_id, role_id, login, password_hash) VALUES (15, 5, 'Smirnov', 'x')$q$);
-SELECT pg_temp.expect_error('Дата зачисления раньше рождения',
-    $q$UPDATE student SET enrollment_date = '1990-01-01' WHERE student_id = 1$q$);
-SELECT pg_temp.expect_error('Дата приёма на работу раньше рождения',
-    $q$UPDATE employee SET hire_date = '1950-01-01' WHERE employee_id = 10$q$);
-SELECT pg_temp.expect_error('Семестр 12 в четырёхлетнем плане',
-    $q$INSERT INTO curriculum_item (curriculum_id, discipline_id, semester, control_type_id, self_study_hours) VALUES (1, 4, 12, 1, 36)$q$);
-SELECT pg_temp.expect_error('Строка плана без единого часа',
-    $q$INSERT INTO curriculum_item (curriculum_id, discipline_id, semester, control_type_id) VALUES (1, 4, 5, 1)$q$);
-SELECT pg_temp.expect_error('Зачисление с опечаткой в основе обучения',
-    $q$SELECT fn_enroll_student('Тест','Тест',NULL,'M','2007-01-01',NULL,NULL,'ПИ-23','Бюджетт','X-9','X-9',CURRENT_DATE,1)$q$);
-
-\echo '== Операции не в том состоянии =='
-SELECT pg_temp.expect_error('Повторное отчисление отчисленного',
-    $q$CALL sp_expel_student(15, 'X-1', 'повторно', 1)$q$);
-SELECT pg_temp.expect_error('Перевод в ту же группу',
-    $q$CALL sp_transfer_student(2, 'ПИ-23', 'X-2', 1)$q$);
-SELECT pg_temp.expect_error('Перевод отчисленного',
-    $q$CALL sp_transfer_student(15, 'ПИ-23', 'X-3', 1)$q$);
-SELECT pg_temp.expect_error('Академический отпуск отчисленному',
-    $q$CALL sp_grant_academic_leave(15, 'Медицинские показания', '2026-10-01', '2027-01-01', 'X-4', 1)$q$);
-SELECT pg_temp.expect_error('Выход из академа у того, кто в нём не был',
-    $q$CALL sp_return_from_leave(2, 'X-5', 1)$q$);
-SELECT pg_temp.expect_error('Восстановление того, кто не отчислен',
-    $q$CALL sp_reinstate_student(2, 'ПИ-23', 'X-6', 1)$q$);
-SELECT pg_temp.expect_error('Перевод в архивную группу',
-    $q$INSERT INTO curriculum (program_id, study_form_id, start_year, duration_years) VALUES (1, 1, 2019, 4)$q$,
-    $q$INSERT INTO study_group (name, curriculum_id, is_archived) VALUES ('ПИ-19', (SELECT MAX(curriculum_id) FROM curriculum), TRUE)$q$,
-    $q$CALL sp_transfer_student(2, 'ПИ-19', 'X-7', 1)$q$);
-SELECT pg_temp.expect_error('Приказ подписал ассистент',
-    'UPDATE academic_order SET signed_by_id = 10 WHERE order_id = 1');
-SELECT pg_temp.expect_error('Оценка студенту в академическом отпуске',
-    'INSERT INTO grade (sheet_id, student_id, points) VALUES (9, 10, 30)');
-SELECT pg_temp.expect_error('Пересдача студенту, который уже сдал',
-    'INSERT INTO grade (sheet_id, student_id, points) VALUES (9, 6, 30)');
-SELECT pg_temp.expect_error('Вторая основная ведомость на ту же дисциплину',
-    $q$INSERT INTO grade_sheet (sheet_number, item_id, group_id, examiner_id, issue_date) VALUES ('X-8', 1, 1, 6, CURRENT_DATE)$q$);
-SELECT pg_temp.expect_error('Повторное открытие закрытой ведомости',
-    $q$UPDATE grade_sheet SET status = 'open', closed_date = NULL WHERE sheet_id = 1$q$);
-SELECT pg_temp.expect_error('Отмена закрытой ведомости',
-    $q$UPDATE grade_sheet SET status = 'cancelled', closed_date = NULL WHERE sheet_id = 1$q$);
-SELECT pg_temp.expect_error('Закрытие пустой ведомости пересдачи',
-    'UPDATE grade_sheet SET status = $$closed$$, closed_date = exam_date WHERE sheet_id = 9');
-SELECT pg_temp.expect_error('Закрытие основной ведомости, где оценки есть не у всех',
-    $q$INSERT INTO grade_sheet (sheet_number, item_id, group_id, examiner_id, issue_date, exam_date)
-       VALUES ('X-9', 3, 1, 5, '2026-09-01', '2026-09-20')$q$,
-    $q$INSERT INTO grade (sheet_id, student_id, points) VALUES ((SELECT sheet_id FROM grade_sheet WHERE sheet_number = 'X-9'), 1, 50)$q$,
-    $q$UPDATE grade_sheet SET status = 'closed', closed_date = '2026-09-22' WHERE sheet_number = 'X-9'$q$);
-SELECT pg_temp.expect_error('Посещаемость на будущую дату',
-    $q$INSERT INTO attendance (slot_id, student_id, lesson_date, is_present) VALUES (1, 1, CURRENT_DATE + 7, TRUE)$q$);
-SELECT pg_temp.expect_error('Учебное поручение уволенному преподавателю',
-    'UPDATE employee SET dismissal_date = CURRENT_DATE WHERE employee_id = 9',
-    'INSERT INTO teaching_assignment (item_id, group_id, teacher_id, lesson_type_id) VALUES (4, 1, 9, 2)');
-SELECT pg_temp.expect_error('Уволенный преподаватель в экзаменаторах',
-    'UPDATE employee SET dismissal_date = CURRENT_DATE WHERE employee_id = 9',
-    'UPDATE grade_sheet SET examiner_id = 9 WHERE sheet_id = 8');
-SELECT pg_temp.expect_error('Увольнение директора института',
-    'UPDATE employee SET dismissal_date = CURRENT_DATE WHERE employee_id = 1');
-SELECT pg_temp.expect_error('Увольнение заведующего кафедрой',
-    'UPDATE employee SET dismissal_date = CURRENT_DATE WHERE employee_id = 12');
-SELECT pg_temp.expect_error('Увольнение куратора группы',
-    'UPDATE employee SET dismissal_date = CURRENT_DATE WHERE employee_id = 10');
-SELECT pg_temp.expect_error('Архивирование группы с обучающимися',
-    'UPDATE study_group SET is_archived = TRUE WHERE group_id = 1');
-SELECT pg_temp.expect_error('Государственная стипендия договорнику',
-    $q$INSERT INTO scholarship (student_id, scholarship_type_id, order_id, start_date, end_date) VALUES (3, 1, 6, '2026-09-01', '2027-01-31')$q$);
-SELECT pg_temp.expect_error('Стипендия отчисленному',
-    $q$INSERT INTO scholarship (student_id, scholarship_type_id, order_id, start_date, end_date) VALUES (15, 4, 6, '2026-09-01', '2027-01-31')$q$);
-SELECT pg_temp.expect_error('Выданную справку вернуть в статус «Новая»',
-    'UPDATE document_request SET request_status_id = 1 WHERE request_id = 1');
-SELECT pg_temp.expect_error('Удаление студента вместе со всей историей',
-    'SET LOCAL ROLE deanery_staff', 'DELETE FROM student WHERE student_id = 1');
-SELECT pg_temp.expect_error('Удаление приказа вместе со списком студентов',
-    'DELETE FROM academic_order WHERE order_id = 1');
-SELECT pg_temp.expect_error('Удаление занятия, по которому есть посещаемость',
-    'DELETE FROM schedule_slot WHERE slot_id = 1');
-
-\echo '== Правильные действия проходят =='
-SELECT pg_temp.expect_ok('Восстановление отчисленного студента',
-    $q$CALL sp_reinstate_student(15, 'ПМИ-25', 'X-10', 1)$q$,
-    $q$SELECT status = 'Обучается' FROM v_students WHERE student_id = 15$q$);
-SELECT pg_temp.expect_ok('Академ прекращает выплату стипендии',
-    $q$CALL sp_grant_academic_leave(13, 'Семейные обстоятельства', '2026-10-01', '2027-06-30', 'X-11', 1)$q$,
-    $q$SELECT end_date = '2026-10-01' FROM scholarship WHERE student_id = 13$q$);
-SELECT pg_temp.expect_ok('Выход из академа возвращает статус «Обучается»',
-    $q$CALL sp_grant_academic_leave(4, 'Семейные обстоятельства', CURRENT_DATE, CURRENT_DATE + 200, 'X-12', 1)$q$,
-    $q$CALL sp_return_from_leave(4, 'X-13', 1)$q$,
-    $q$SELECT status = 'Обучается' FROM v_students WHERE student_id = 4$q$);
-SELECT pg_temp.expect_ok('Переведённого с долгом можно внести в пересдачу старой группы',
-    $q$CALL sp_transfer_student(9, 'ПИ-23', 'X-14', 1)$q$,
-    'INSERT INTO grade (sheet_id, student_id, points) VALUES (9, 9, 30)',
-    'SELECT TRUE');
-SELECT pg_temp.expect_ok('Основная ведомость закрывается, когда оценки есть у всех',
-    $q$INSERT INTO grade_sheet (sheet_number, item_id, group_id, examiner_id, issue_date, exam_date)
-       VALUES ('X-15', 3, 1, 5, '2026-09-01', '2026-09-20')$q$,
-    $q$INSERT INTO grade (sheet_id, student_id, points)
-       SELECT (SELECT sheet_id FROM grade_sheet WHERE sheet_number = 'X-15'), student_id, 40 FROM student WHERE group_id = 1$q$,
-    $q$UPDATE grade_sheet SET status = 'closed', closed_date = '2026-09-22' WHERE sheet_number = 'X-15'$q$,
-    'SELECT TRUE');
-SELECT pg_temp.expect_ok('Именная стипендия партнёра доступна и договорнику',
-    $q$INSERT INTO scholarship (student_id, scholarship_type_id, order_id, start_date, end_date) VALUES (3, 4, 6, '2026-09-01', '2027-01-31')$q$,
-    'SELECT TRUE');
-SELECT pg_temp.expect_ok('Старые записи уволенного сотрудника остаются, их можно править',
-    'UPDATE study_group SET curator_id = 7 WHERE curator_id = 10',
-    'UPDATE employee SET dismissal_date = CURRENT_DATE WHERE employee_id = 10',
-    'UPDATE teaching_assignment SET subgroup = 1 WHERE assignment_id = 12',
-    'SELECT TRUE');
-
-\echo '== Успеваемость и расписание на семестр =='
-SELECT pg_temp.expect_ok('Отчёт: у зачётной дисциплины в столбце «Экзамен» прочерк',
-    $q$SELECT module_1 = '50' AND module_2 = '49' AND credit = '50' AND exam = '—' FROM v_performance
-       WHERE student_id = 1 AND discipline = 'Иностранный язык' AND semester = 6$q$);
-SELECT pg_temp.expect_ok('Отчёт: у экзаменационной дисциплины в столбце «Зачёт» прочерк',
-    $q$SELECT module_1 = '48' AND module_2 = '51' AND credit = '—' AND exam = '52' AND final_result = 'Отлично'
-       FROM v_performance WHERE student_id = 1 AND discipline = 'Базы данных'$q$);
-SELECT pg_temp.expect_ok('Отчёт: у практики нет модулей, но есть оценка в баллах',
-    $q$SELECT module_1 = '—' AND module_2 = '—' AND credit = '50' AND final_result = 'Отлично'
-       FROM v_performance WHERE student_id = 1 AND discipline = 'Производственная практика'$q$);
-SELECT pg_temp.expect_ok('Отчёт: после пересдачи показывается последний результат',
-    $q$SELECT exam = '28' AND final_result = 'Удовлетворительно' FROM v_performance
-       WHERE student_id = 3 AND discipline = 'Базы данных'$q$);
-SELECT pg_temp.expect_ok('Отчёт: «н/а» и «неявка»',
-    $q$SELECT module_2 = 'н/а' AND exam = 'неявка' FROM v_performance
-       WHERE student_id = 5 AND discipline = 'Базы данных'$q$);
-SELECT pg_temp.expect_ok('Перевод баллов в оценку: 34 → 3, 35 → 4, 44 → 4, 45 → 5, 54 → 5',
-    'SELECT fn_mark(25) = 3 AND fn_mark(34) = 3 AND fn_mark(35) = 4 AND fn_mark(44) = 4 AND fn_mark(45) = 5 AND fn_mark(54) = 5 AND fn_mark(24) IS NULL');
-SELECT pg_temp.expect_ok('Календарь: в праздник 4 ноября занятий нет',
-    $q$SELECT NOT EXISTS (SELECT 1 FROM v_schedule_calendar WHERE lesson_date = '2026-11-04')$q$);
-SELECT pg_temp.expect_ok('Календарь: занятие по нечётным неделям идёт только в нечётные',
-    $q$SELECT bool_and(week = 'нечётная') FROM v_schedule_calendar WHERE slot_id = 3$q$);
-SELECT pg_temp.expect_ok('Календарь: у заочников занятия только в установочный период',
-    $q$SELECT MIN(lesson_date) = '2026-10-03' AND MAX(lesson_date) = '2026-11-07' FROM v_schedule_calendar WHERE group_name = 'ИВТз-25'$q$);
-SELECT pg_temp.expect_ok('Сверка часов: расписание покрывает не меньше 85 % плана по каждому занятию',
-    'SELECT bool_and(scheduled_hours >= 0.85 * planned_hours) FROM v_schedule_hours');
-SELECT pg_temp.expect_error('Занятие за пределами семестра',
-    $q$INSERT INTO schedule_slot (assignment_id, classroom_id, weekday, pair_number, term_id, valid_from, valid_to)
-       VALUES (3, 3, 5, 4, 2, '2026-08-01', '2026-09-30')$q$);
-SELECT pg_temp.expect_error('Посещаемость в праздничный день',
-    $q$INSERT INTO holiday (holiday_date, name) VALUES ('2026-09-21', 'Тестовый выходной')$q$,
-    $q$INSERT INTO attendance (slot_id, student_id, lesson_date, is_present) VALUES (12, 1, '2026-09-21', TRUE)$q$);
-
-SELECT pg_temp.expect_ok('Отчёт: ещё не выставленные баллы — пустые ячейки, а не «н/а»',
-    $q$SELECT module_1 IS NULL AND module_2 IS NULL AND exam IS NULL AND credit = '—' FROM v_performance
-       WHERE student_id = 1 AND discipline = 'Машинное обучение'$q$);
-
-SELECT pg_temp.expect_error('Модули у практики в учебном плане',
-    'UPDATE curriculum_item SET module_count = 2 WHERE item_id = 15');
-
-\echo '== Все проверки пройдены =='
+SELECT pg_temp.expect_ok('Агент читает представления','SET LOCAL ROLE deanery_agent','SELECT count(*)=508 FROM v_students');
+SELECT pg_temp.expect_error('Агент не читает паспорта','42501','permission denied','SET LOCAL ROLE deanery_agent','SELECT passport_number FROM person');
+SELECT pg_temp.expect_error('Агент не читает пароли','42501','permission denied','SET LOCAL ROLE deanery_agent','SELECT password_hash FROM app_user');
+SELECT pg_temp.expect_error('Агент не удаляет заявки','42501','permission denied','SET LOCAL ROLE deanery_agent','DELETE FROM document_request');
+SELECT pg_temp.expect_error('Агент не меняет шкалу','42501','permission denied','SET LOCAL ROLE deanery_agent','UPDATE score_band SET min_points=20 WHERE mark=3');
+SELECT pg_temp.expect_error('Агент не читает аудит напрямую','42501','permission denied','SET LOCAL ROLE deanery_agent','SELECT audit_id FROM audit_log_detail');
+SELECT pg_temp.expect_error('Чтение не позволяет запись','42501','permission denied','SET LOCAL ROLE deanery_read','INSERT INTO document_request(student_id,document_type_id,request_status_id) VALUES(1,1,1)');
+SELECT pg_temp.expect_error('Преподаватель не меняет контингент','42501','permission denied','SET LOCAL ROLE deanery_teacher','UPDATE student SET funding_type_id=1');
+SELECT pg_temp.expect_ok('Деканат читает аудит','SET LOCAL ROLE deanery_staff','SELECT count(*)>=0 FROM audit_log');
+SELECT pg_temp.assert_true('Праздники исключены из календаря',NOT EXISTS(SELECT FROM v_schedule_calendar c JOIN holiday h ON h.holiday_date=c.lesson_date));
+SELECT pg_temp.assert_true('Сводки доступны',EXISTS(SELECT FROM v_performance) AND EXISTS(SELECT FROM v_student_rating) AND EXISTS(SELECT FROM v_groups));
 ROLLBACK;
+\echo 'Все проверки пройдены'

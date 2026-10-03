@@ -31,7 +31,17 @@ def test_read_students_with_pagination_and_aggregation():
         count = execute_read_query(db, "SELECT count(*) AS n FROM v_students LIMIT 1")
     assert len(first["rows"]) == len(second["rows"]) == 2
     assert first["rows"][0]["student_id"] != second["rows"][0]["student_id"]
-    assert count["rows"][0]["n"] >= 4
+    assert count["rows"][0]["n"] == 508
+    with DeaneryReadSession() as db:
+        statuses = execute_read_query(
+            db, "SELECT status, count(*) AS n FROM v_students GROUP BY status LIMIT 10")
+    assert {row["status"]: row["n"] for row in statuses["rows"]} == {
+        "Обучается": 494, "Академический отпуск": 3, "Отчислен": 11,
+    }
+    with DeaneryReadSession() as db:
+        groups = execute_read_query(
+            db, "SELECT count(DISTINCT group_name) AS n FROM v_students LIMIT 1")
+    assert groups["rows"][0]["n"] == 22
 
 
 def test_read_role_cannot_switch_to_application_role_or_write():
