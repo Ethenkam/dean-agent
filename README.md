@@ -111,8 +111,14 @@ done
 
 ## Вложения и интеграция с backend_dean
 
-Бэкенд склонирован в `backend_dean/` из https://github.com/PurpleCloudy/backend_dean.
-Этот каталог — отдельный Git-репозиторий. Обновлённый агент включён в
+**Бэкенд — [PurpleCloudy](https://github.com/PurpleCloudy).**
+Оригинальный репозиторий: [PurpleCloudy/backend_dean](https://github.com/PurpleCloudy/backend_dean).
+
+Бэкенд добавлен отдельной папкой [`backend_dean/`](backend_dean/) в этот
+репозиторий с сохранением лицензии и авторства. В локальную версию внесены
+изменения для приёма документов, фото и сканов PDF и подключения нашего агента.
+Инструкции бэкенда: [`backend_dean/README.md`](backend_dean/README.md).
+Обновлённый агент включён в
 `backend_dean/references/dean-agent`; адаптер использует аутентификацию, привязку
 версий, ограничения доступа и подписанные запросы бэкенда. Для переноса следующих
 изменений агента: `.venv/bin/python scripts/sync_backend_agent.py`.

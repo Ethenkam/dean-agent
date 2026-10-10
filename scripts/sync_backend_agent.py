@@ -1,11 +1,11 @@
-"""Update the bundled agent in the cloned backend, preserving attribution files."""
+"""Update the bundled agent in the backend source folder, preserving attribution files."""
 from pathlib import Path
 import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / 'backend_dean'
-if not (BACKEND / '.git').exists():
-    raise SystemExit('Clone https://github.com/PurpleCloudy/backend_dean.git into backend_dean first')
+if not (BACKEND / 'backend/deanery_api/main.py').is_file():
+    raise SystemExit('Backend source folder backend_dean is missing')
 destination = BACKEND / 'references/dean-agent'
 for file in (ROOT / 'dean_agent').glob('*.py'):
     shutil.copy2(file, destination / 'dean_agent' / file.name)
