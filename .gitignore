@@ -7,3 +7,5 @@ __pycache__/
 .data/
 .qdrant-initialized
 .DS_Store
+
+backend_dean/
